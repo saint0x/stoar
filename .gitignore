@@ -1,0 +1,11 @@
+*.db
+*.db-wal
+*.db-shm
+target/
+.DS_Store
+*.png
+*.mov
+test-*.png
+test-*.mov
+ecommerce.db
+example.db

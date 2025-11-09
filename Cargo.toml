@@ -1,0 +1,42 @@
+[package]
+name = "stoar"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "stoar"
+path = "src/lib.rs"
+
+[[bin]]
+name = "stoar_cli"
+path = "src/bin/cli.rs"
+required-features = ["cli"]
+
+[dependencies]
+# SQLite - bundled for portability
+rusqlite = { version = "0.31", features = ["bundled", "chrono"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Utilities
+uuid = { version = "1.0", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling
+thiserror = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", optional = true }
+
+[features]
+default = []
+cli = ["tracing-subscriber"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
