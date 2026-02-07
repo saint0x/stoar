@@ -5,8 +5,7 @@ use uuid::Uuid;
 
 use crate::error::{Result, StoreError};
 
-/// Ultra-lightweight unified storage for structured data + blobs
-/// Single file, single transaction boundary, maximum performance
+/// Unified storage for structured data and binary blobs in a single SQLite file
 pub struct Store {
     conn: Mutex<Connection>,
     instance_id: String,
@@ -17,7 +16,6 @@ impl Store {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let conn = Connection::open(path)?;
 
-        // Performance tuning for low latency
         let _ = conn.execute_batch("PRAGMA journal_mode = WAL")?;
         let _ = conn.execute_batch("PRAGMA synchronous = NORMAL")?;
         let _ = conn.execute_batch("PRAGMA cache_size = 10000")?;
@@ -34,7 +32,7 @@ impl Store {
         Ok(store)
     }
 
-    /// Memory-only database (useful for tests)
+    /// Create an in-memory database (no file on disk)
     pub fn memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
 
@@ -53,19 +51,17 @@ impl Store {
         Ok(store)
     }
 
-    /// Initialize internal schema (idempotent) - called on first put/get
+    /// Initialize internal schema (idempotent, called eagerly on construction)
     #[allow(clippy::str_to_string)]
     fn init_schema(&self) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| {
             StoreError::InvalidConfig(format!("Failed to acquire lock: {}", e))
         })?;
 
-        // Create tables individually - use single line SQL to avoid execute_batch issues
         let _ = conn.execute_batch("CREATE TABLE IF NOT EXISTS __meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")?;
 
         let _ = conn.execute_batch("CREATE TABLE IF NOT EXISTS __objects (key TEXT PRIMARY KEY, data BLOB NOT NULL, mime_type TEXT, size INTEGER, hash TEXT, created_at INTEGER, updated_at INTEGER)")?;
 
-        // Initialize meta table with instance_id and schema version
         let _ = conn.execute(
             "INSERT OR IGNORE INTO __meta VALUES ('instance_id', ?)",
             params![&self.instance_id],
@@ -162,11 +158,10 @@ impl Store {
     }
 
     // ============================================================================
-    // Structured Data API - Clean & Sleek
+    // Structured Data API
     // ============================================================================
 
-    /// Put a JSON-serializable value into a collection
-    /// Auto-creates collection if it doesn't exist
+    /// Put a JSON-serializable value into a collection (auto-creates if needed)
     #[inline]
     pub fn put<T: serde::Serialize>(&self, collection: &str, key: &str, value: &T) -> Result<()> {
         validate_key(key)?;
@@ -277,21 +272,20 @@ impl Store {
     }
 
     // ============================================================================
-    // Blob Storage API - Integrated
+    // Blob Storage API
     // ============================================================================
 
-    /// Write binary data with optional metadata
+    /// Write binary data
     #[inline]
     pub fn write(&self, key: &str, data: &[u8]) -> Result<()> {
         self.write_with_meta(key, data, None)
     }
 
-    /// Write with MIME type
+    /// Write binary data with MIME type metadata
     #[inline]
     pub fn write_with_meta(&self, key: &str, data: &[u8], mime_type: Option<&str>) -> Result<()> {
         validate_key(key)?;
 
-        // Initialize schema on first write
         self.init_schema()?;
 
         let hash = format!("{:x}", calculate_hash(data));
@@ -385,7 +379,7 @@ impl Store {
     // Transactions
     // ============================================================================
 
-    /// Execute a transaction - automatically commits on success
+    /// Execute operations atomically; commits on success, rolls back on error
     pub fn tx<F, T>(&self, f: F) -> Result<T>
     where
         F: FnOnce(&TxHandle) -> Result<T>,
@@ -406,7 +400,6 @@ impl Store {
     // ============================================================================
 
     fn put_raw(&self, collection: &str, key: &str, data: &str) -> Result<()> {
-        // Initialize schema on first write
         self.init_schema()?;
 
         let conn = self
@@ -473,7 +466,7 @@ pub struct TxHandle<'a> {
 }
 
 impl<'a> TxHandle<'a> {
-    /// Put during transaction
+    /// Put a JSON-serializable value into a collection
     #[inline]
     pub fn put<T: serde::Serialize>(
         &self,
@@ -496,7 +489,7 @@ impl<'a> TxHandle<'a> {
         Ok(())
     }
 
-    /// Get during transaction
+    /// Get a value from a collection
     #[inline]
     pub fn get<T: serde::de::DeserializeOwned>(
         &self,
@@ -521,7 +514,7 @@ impl<'a> TxHandle<'a> {
         }
     }
 
-    /// Delete a value from a collection during transaction
+    /// Delete a value from a collection
     #[inline]
     pub fn delete(&self, collection: &str, key: &str) -> Result<()> {
         validate_key(key)?;
@@ -535,13 +528,13 @@ impl<'a> TxHandle<'a> {
         Ok(())
     }
 
-    /// Write blob during transaction
+    /// Write binary data
     #[inline]
     pub fn write(&self, key: &str, data: &[u8]) -> Result<()> {
         self.write_with_meta(key, data, None)
     }
 
-    /// Write blob with metadata during transaction
+    /// Write binary data with MIME type metadata
     #[inline]
     pub fn write_with_meta(&self, key: &str, data: &[u8], mime_type: Option<&str>) -> Result<()> {
         validate_key(key)?;
@@ -567,7 +560,7 @@ impl<'a> TxHandle<'a> {
         Ok(())
     }
 
-    /// Read binary blob during transaction
+    /// Read binary data
     #[inline]
     pub fn read(&self, key: &str) -> Result<Option<Vec<u8>>> {
         validate_key(key)?;
@@ -584,7 +577,7 @@ impl<'a> TxHandle<'a> {
         Ok(data)
     }
 
-    /// Get blob metadata during transaction
+    /// Get metadata about a blob
     #[inline]
     pub fn meta(&self, key: &str) -> Result<Option<BlobMeta>> {
         validate_key(key)?;
@@ -609,7 +602,7 @@ impl<'a> TxHandle<'a> {
         Ok(meta)
     }
 
-    /// Remove a blob during transaction
+    /// Remove a blob
     #[inline]
     pub fn remove(&self, key: &str) -> Result<()> {
         validate_key(key)?;
@@ -617,7 +610,7 @@ impl<'a> TxHandle<'a> {
         Ok(())
     }
 
-    /// Get all items from a collection during transaction
+    /// Get all values from a collection
     #[inline]
     pub fn all<T: serde::de::DeserializeOwned>(&self, collection: &str) -> Result<Vec<T>> {
         ensure_collection_tx(self.tx, collection)?;
@@ -625,7 +618,7 @@ impl<'a> TxHandle<'a> {
         self.query::<T>(&sql, &[])
     }
 
-    /// Count items in a collection during transaction
+    /// Count items in a collection
     #[inline]
     pub fn count(&self, collection: &str) -> Result<usize> {
         ensure_collection_tx(self.tx, collection)?;
@@ -637,7 +630,7 @@ impl<'a> TxHandle<'a> {
         Ok(count)
     }
 
-    /// Check if a key exists in a collection during transaction
+    /// Check if a key exists in a collection
     #[inline]
     pub fn exists(&self, collection: &str, key: &str) -> Result<bool> {
         ensure_collection_tx(self.tx, collection)?;
@@ -649,7 +642,7 @@ impl<'a> TxHandle<'a> {
         Ok(exists)
     }
 
-    /// Query a collection with SQL during transaction
+    /// Execute a raw SQL query
     #[inline]
     pub fn query<T: serde::de::DeserializeOwned>(
         &self,
@@ -694,7 +687,7 @@ pub struct BlobMeta {
 // Helpers
 // ============================================================================
 
-/// Validates a key for proper format
+/// Validates a key is non-empty and within 1024 bytes
 #[inline]
 fn validate_key(key: &str) -> Result<()> {
     if key.is_empty() {
