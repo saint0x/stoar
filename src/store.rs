@@ -30,6 +30,7 @@ impl Store {
             instance_id,
         };
 
+        store.init_schema()?;
         Ok(store)
     }
 
@@ -48,6 +49,7 @@ impl Store {
             instance_id,
         };
 
+        store.init_schema()?;
         Ok(store)
     }
 
@@ -89,6 +91,74 @@ impl Store {
     #[inline]
     pub fn instance_id(&self) -> &str {
         &self.instance_id
+    }
+
+    /// List all user-created collections (excludes internal tables)
+    #[inline]
+    pub fn collections(&self) -> Result<Vec<String>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StoreError::InvalidConfig(format!("Failed to acquire lock: {}", e)))?;
+
+        let mut stmt = conn.prepare(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE '\\_%' ESCAPE '\\'"
+        )?;
+
+        let names = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(names)
+    }
+
+    /// List all stored blobs with metadata
+    #[inline]
+    pub fn blobs(&self) -> Result<Vec<(String, BlobMeta)>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StoreError::InvalidConfig(format!("Failed to acquire lock: {}", e)))?;
+
+        let mut stmt = conn.prepare(
+            "SELECT key, size, mime_type, hash, created_at, updated_at FROM __objects ORDER BY key"
+        )?;
+
+        let items = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    BlobMeta {
+                        size: row.get(1)?,
+                        mime_type: row.get(2)?,
+                        hash: row.get(3)?,
+                        created_at: row.get(4)?,
+                        updated_at: row.get(5)?,
+                    },
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(items)
+    }
+
+    /// Get database metadata as key-value pairs
+    #[inline]
+    pub fn info(&self) -> Result<Vec<(String, String)>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StoreError::InvalidConfig(format!("Failed to acquire lock: {}", e)))?;
+
+        let mut stmt = conn.prepare("SELECT key, value FROM __meta ORDER BY key")?;
+
+        let pairs = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(pairs)
     }
 
     // ============================================================================
@@ -606,7 +676,7 @@ impl<'a> TxHandle<'a> {
 // ============================================================================
 
 /// Metadata about a stored blob
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BlobMeta {
     /// Size of the blob in bytes
     pub size: i64,
@@ -665,4 +735,370 @@ fn calculate_hash(data: &[u8]) -> u64 {
     let mut hasher = DefaultHasher::new();
     data.hash(&mut hasher);
     hasher.finish()
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+    struct TestUser {
+        name: String,
+        age: u32,
+    }
+
+    // ============================
+    // Schema initialization
+    // ============================
+
+    #[test]
+    fn fresh_store_get_returns_none() {
+        let store = Store::memory().unwrap();
+        let result: Option<TestUser> = store.get("users", "nonexistent").unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn fresh_store_read_returns_none() {
+        let store = Store::memory().unwrap();
+        let result = store.read("nonexistent").unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn fresh_store_meta_returns_none() {
+        let store = Store::memory().unwrap();
+        let result = store.meta("nonexistent").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn fresh_store_collections_returns_empty() {
+        let store = Store::memory().unwrap();
+        let collections = store.collections().unwrap();
+        assert!(collections.is_empty());
+    }
+
+    #[test]
+    fn fresh_store_blobs_returns_empty() {
+        let store = Store::memory().unwrap();
+        let blobs = store.blobs().unwrap();
+        assert!(blobs.is_empty());
+    }
+
+    // ============================
+    // Structured data
+    // ============================
+
+    #[test]
+    fn put_get_roundtrip() {
+        let store = Store::memory().unwrap();
+        let user = TestUser { name: "Alice".to_string(), age: 30 };
+        store.put("users", "alice", &user).unwrap();
+        let retrieved: Option<TestUser> = store.get("users", "alice").unwrap();
+        assert_eq!(retrieved, Some(user));
+    }
+
+    #[test]
+    fn put_overwrites_existing() {
+        let store = Store::memory().unwrap();
+        let user1 = TestUser { name: "Alice".to_string(), age: 30 };
+        let user2 = TestUser { name: "Alice Updated".to_string(), age: 31 };
+        store.put("users", "alice", &user1).unwrap();
+        store.put("users", "alice", &user2).unwrap();
+        let retrieved: Option<TestUser> = store.get("users", "alice").unwrap();
+        assert_eq!(retrieved, Some(user2));
+    }
+
+    #[test]
+    fn get_nonexistent_returns_none() {
+        let store = Store::memory().unwrap();
+        store.put("users", "alice", &TestUser { name: "Alice".to_string(), age: 30 }).unwrap();
+        let result: Option<TestUser> = store.get("users", "missing").unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn delete_then_get_returns_none() {
+        let store = Store::memory().unwrap();
+        let user = TestUser { name: "Alice".to_string(), age: 30 };
+        store.put("users", "alice", &user).unwrap();
+        store.delete("users", "alice").unwrap();
+        let result: Option<TestUser> = store.get("users", "alice").unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn exists_returns_correct_values() {
+        let store = Store::memory().unwrap();
+        store.put("users", "alice", &TestUser { name: "Alice".to_string(), age: 30 }).unwrap();
+        assert!(store.exists("users", "alice").unwrap());
+        assert!(!store.exists("users", "missing").unwrap());
+    }
+
+    #[test]
+    fn count_returns_correct_number() {
+        let store = Store::memory().unwrap();
+        assert_eq!(store.count("users").unwrap(), 0);
+        store.put("users", "a", &TestUser { name: "A".to_string(), age: 1 }).unwrap();
+        store.put("users", "b", &TestUser { name: "B".to_string(), age: 2 }).unwrap();
+        store.put("users", "c", &TestUser { name: "C".to_string(), age: 3 }).unwrap();
+        assert_eq!(store.count("users").unwrap(), 3);
+    }
+
+    #[test]
+    fn all_returns_items_in_order() {
+        let store = Store::memory().unwrap();
+        let users = vec![
+            TestUser { name: "Alice".to_string(), age: 30 },
+            TestUser { name: "Bob".to_string(), age: 25 },
+            TestUser { name: "Charlie".to_string(), age: 35 },
+        ];
+        for (i, u) in users.iter().enumerate() {
+            store.put("users", &format!("user{}", i), u).unwrap();
+        }
+        let all: Vec<TestUser> = store.all("users").unwrap();
+        assert_eq!(all, users);
+    }
+
+    #[test]
+    fn query_with_json_extract() {
+        let store = Store::memory().unwrap();
+        store.put("users", "alice", &TestUser { name: "Alice".to_string(), age: 30 }).unwrap();
+        store.put("users", "bob", &TestUser { name: "Bob".to_string(), age: 20 }).unwrap();
+        store.put("users", "charlie", &TestUser { name: "Charlie".to_string(), age: 40 }).unwrap();
+
+        let old_users: Vec<TestUser> = store.query(
+            "SELECT data FROM [users] WHERE json_extract(data, '$.age') > ?",
+            &[&25],
+        ).unwrap();
+        assert_eq!(old_users.len(), 2);
+    }
+
+    #[test]
+    fn put_get_json_value() {
+        let store = Store::memory().unwrap();
+        let data = serde_json::json!({"nested": {"key": "value"}, "array": [1, 2, 3]});
+        store.put("config", "settings", &data).unwrap();
+        let retrieved: Option<serde_json::Value> = store.get("config", "settings").unwrap();
+        assert_eq!(retrieved, Some(data));
+    }
+
+    // ============================
+    // Blob storage
+    // ============================
+
+    #[test]
+    fn write_read_roundtrip() {
+        let store = Store::memory().unwrap();
+        let data = b"hello world binary data\x00\x01\x02";
+        store.write("test.bin", data).unwrap();
+        let read = store.read("test.bin").unwrap();
+        assert_eq!(read, Some(data.to_vec()));
+    }
+
+    #[test]
+    fn write_with_meta_stores_mime() {
+        let store = Store::memory().unwrap();
+        let data = b"PNG fake data";
+        store.write_with_meta("photo.png", data, Some("image/png")).unwrap();
+        let meta = store.meta("photo.png").unwrap().unwrap();
+        assert_eq!(meta.mime_type, Some("image/png".to_string()));
+        assert_eq!(meta.size, data.len() as i64);
+        assert!(!meta.hash.is_empty());
+    }
+
+    #[test]
+    fn blob_read_nonexistent_returns_none() {
+        let store = Store::memory().unwrap();
+        let result = store.read("nonexistent.bin").unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn blob_meta_nonexistent_returns_none() {
+        let store = Store::memory().unwrap();
+        let result = store.meta("nonexistent.bin").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn remove_then_read_returns_none() {
+        let store = Store::memory().unwrap();
+        store.write("test.bin", b"data").unwrap();
+        store.remove("test.bin").unwrap();
+        let result = store.read("test.bin").unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn large_blob() {
+        let store = Store::memory().unwrap();
+        let data: Vec<u8> = (0..100_000).map(|i| (i % 256) as u8).collect();
+        store.write("large.bin", &data).unwrap();
+        let read = store.read("large.bin").unwrap().unwrap();
+        assert_eq!(read.len(), data.len());
+        assert_eq!(read, data);
+    }
+
+    // ============================
+    // Transactions
+    // ============================
+
+    #[test]
+    fn tx_commit_persists() {
+        let store = Store::memory().unwrap();
+        store.tx(|tx| {
+            tx.put("users", "alice", &TestUser { name: "Alice".to_string(), age: 30 })?;
+            tx.put("users", "bob", &TestUser { name: "Bob".to_string(), age: 25 })?;
+            Ok(())
+        }).unwrap();
+        assert_eq!(store.count("users").unwrap(), 2);
+    }
+
+    #[test]
+    fn tx_error_rolls_back() {
+        let store = Store::memory().unwrap();
+        let result: Result<()> = store.tx(|tx| {
+            tx.put("users", "alice", &TestUser { name: "Alice".to_string(), age: 30 })?;
+            Err(StoreError::InvalidKey("deliberate error".to_string()))
+        });
+        assert!(result.is_err());
+        assert_eq!(store.count("users").unwrap(), 0);
+    }
+
+    #[test]
+    fn tx_mixed_operations() {
+        let store = Store::memory().unwrap();
+        store.tx(|tx| {
+            tx.put("users", "alice", &TestUser { name: "Alice".to_string(), age: 30 })?;
+            tx.write("doc.txt", b"hello")?;
+            Ok(())
+        }).unwrap();
+        let user: Option<TestUser> = store.get("users", "alice").unwrap();
+        assert!(user.is_some());
+        let blob = store.read("doc.txt").unwrap();
+        assert_eq!(blob, Some(b"hello".to_vec()));
+    }
+
+    #[test]
+    fn tx_read_after_write() {
+        let store = Store::memory().unwrap();
+        store.tx(|tx| {
+            tx.put("users", "alice", &TestUser { name: "Alice".to_string(), age: 30 })?;
+            let user: Option<TestUser> = tx.get("users", "alice")?;
+            assert_eq!(user.unwrap().name, "Alice");
+            Ok(())
+        }).unwrap();
+    }
+
+    // ============================
+    // Validation
+    // ============================
+
+    #[test]
+    fn empty_key_returns_error() {
+        let store = Store::memory().unwrap();
+        let result = store.put("users", "", &TestUser { name: "A".to_string(), age: 1 });
+        assert!(matches!(result, Err(StoreError::InvalidKey(_))));
+    }
+
+    #[test]
+    fn key_over_1024_bytes_returns_error() {
+        let store = Store::memory().unwrap();
+        let long_key = "x".repeat(1025);
+        let result = store.put("users", &long_key, &TestUser { name: "A".to_string(), age: 1 });
+        assert!(matches!(result, Err(StoreError::InvalidKey(_))));
+    }
+
+    #[test]
+    fn empty_collection_returns_error() {
+        let store = Store::memory().unwrap();
+        let result = store.put("", "key", &TestUser { name: "A".to_string(), age: 1 });
+        assert!(matches!(result, Err(StoreError::InvalidKey(_))));
+    }
+
+    // ============================
+    // Edge cases
+    // ============================
+
+    #[test]
+    fn multiple_collections_isolated() {
+        let store = Store::memory().unwrap();
+        store.put("users", "key1", &"user_value").unwrap();
+        store.put("config", "key1", &"config_value").unwrap();
+
+        let user: Option<String> = store.get("users", "key1").unwrap();
+        let config: Option<String> = store.get("config", "key1").unwrap();
+
+        assert_eq!(user, Some("user_value".to_string()));
+        assert_eq!(config, Some("config_value".to_string()));
+    }
+
+    #[test]
+    fn collections_lists_user_tables() {
+        let store = Store::memory().unwrap();
+        store.put("users", "a", &"val").unwrap();
+        store.put("config", "b", &"val").unwrap();
+        let mut collections = store.collections().unwrap();
+        collections.sort();
+        assert_eq!(collections, vec!["config", "users"]);
+    }
+
+    #[test]
+    fn blobs_lists_all_stored() {
+        let store = Store::memory().unwrap();
+        store.write_with_meta("a.txt", b"aaa", Some("text/plain")).unwrap();
+        store.write_with_meta("b.png", b"bbb", Some("image/png")).unwrap();
+        let blobs = store.blobs().unwrap();
+        assert_eq!(blobs.len(), 2);
+        assert_eq!(blobs[0].0, "a.txt");
+        assert_eq!(blobs[1].0, "b.png");
+    }
+
+    #[test]
+    fn info_returns_metadata() {
+        let store = Store::memory().unwrap();
+        let info = store.info().unwrap();
+        let keys: Vec<&str> = info.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(keys.contains(&"instance_id"));
+        assert!(keys.contains(&"schema_version"));
+        assert!(keys.contains(&"initialized_at"));
+    }
+
+    #[test]
+    fn instance_id_is_uuid_v4() {
+        let store = Store::memory().unwrap();
+        let id = store.instance_id();
+        assert_eq!(id.len(), 36);
+        assert_eq!(id.chars().filter(|c| *c == '-').count(), 4);
+    }
+
+    #[test]
+    fn blob_hash_is_consistent() {
+        let store = Store::memory().unwrap();
+        let data = b"consistent data";
+        store.write("test1", data).unwrap();
+        let meta1 = store.meta("test1").unwrap().unwrap();
+        store.remove("test1").unwrap();
+        store.write("test1", data).unwrap();
+        let meta2 = store.meta("test1").unwrap().unwrap();
+        assert_eq!(meta1.hash, meta2.hash);
+    }
+
+    #[test]
+    fn write_preserves_created_at_on_update() {
+        let store = Store::memory().unwrap();
+        store.write("test", b"v1").unwrap();
+        let meta1 = store.meta("test").unwrap().unwrap();
+        store.write("test", b"v2").unwrap();
+        let meta2 = store.meta("test").unwrap().unwrap();
+        assert_eq!(meta1.created_at, meta2.created_at);
+        assert_eq!(meta2.size, 2);
+    }
 }

@@ -8,7 +8,7 @@ name = "stoar"
 path = "src/lib.rs"
 
 [[bin]]
-name = "stoar_cli"
+name = "stoar"
 path = "src/bin/cli.rs"
 required-features = ["cli"]
 
@@ -31,9 +31,12 @@ thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", optional = true }
 
+# CLI
+clap = { version = "4", features = ["derive"], optional = true }
+
 [features]
 default = []
-cli = ["tracing-subscriber"]
+cli = ["tracing-subscriber", "clap"]
 
 [profile.release]
 opt-level = 3
