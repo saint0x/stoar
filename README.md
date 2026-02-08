@@ -1,6 +1,6 @@
 # stoar
 
-Unified storage: JSON collections + binary blobs in a single SQLite file. Available as a Rust library or standalone CLI binary (2.4MB, zero runtime dependencies).
+SQLite + object store in one file. Store JSON documents and binary blobs with a clean API. Ships as a Rust library or a 2.4MB CLI binary with zero runtime dependencies.
 
 ## Install
 
