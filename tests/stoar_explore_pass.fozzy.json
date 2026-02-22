@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "name": "stoar-explore-pass",
+  "distributed": {
+    "node_count": 3,
+    "steps": [
+      { "type": "client_put", "node": "n0", "key": "k", "value": "v" },
+      { "type": "tick", "duration": "10ms" }
+    ],
+    "invariants": [
+      { "type": "kv_node_equals", "node": "n0", "key": "k", "equals": "v" }
+    ]
+  }
+}

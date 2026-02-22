@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "name": "stoar-det",
+  "steps": [
+    { "name": "start", "type": "trace_event" },
+    { "a": 2, "b": 2, "type": "assert_eq_int" }
+  ]
+}

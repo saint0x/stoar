@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "name": "distributed-smoke",
+  "distributed": {
+    "node_count": 3,
+    "steps": [
+      { "type": "client_put", "node": "n0", "key": "k", "value": "v" },
+      { "type": "tick", "duration": "10ms" }
+    ],
+    "invariants": [
+      { "type": "kv_present_on_all", "key": "k" }
+    ]
+  }
+}

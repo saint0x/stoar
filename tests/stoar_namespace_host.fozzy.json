@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "name": "stoar-namespace-host",
+  "steps": [
+    {
+      "type": "proc_spawn",
+      "cmd": "rm",
+      "args": ["-f", "/tmp/stoar_ns_host.db"],
+      "expect_exit": 0
+    },
+    {
+      "type": "proc_spawn",
+      "cmd": "./target/aarch64-apple-darwin/debug/stoar",
+      "args": ["--db", "/tmp/stoar_ns_host.db", "namespace", "set", "nsq", "--token", "nsq-token", "--max-objects", "1"],
+      "expect_exit": 0
+    },
+    {
+      "type": "proc_spawn",
+      "cmd": "sh",
+      "args": ["-lc", "printf aaa | ./target/aarch64-apple-darwin/debug/stoar --db /tmp/stoar_ns_host.db cas put -"],
+      "expect_exit": 0
+    },
+    {
+      "type": "proc_spawn",
+      "cmd": "sh",
+      "args": ["-lc", "printf bbb | ./target/aarch64-apple-darwin/debug/stoar --db /tmp/stoar_ns_host.db cas put -"],
+      "expect_exit": 0
+    },
+    {
+      "type": "proc_spawn",
+      "cmd": "./target/aarch64-apple-darwin/debug/stoar",
+      "args": ["--db", "/tmp/stoar_ns_host.db", "alias", "set", "nsq", "a", "sha256:9834876dcfb05cb167a5c24953eba58c4ac89b1adf57f28f2f9d09af107ee8f0"],
+      "expect_exit": 0
+    },
+    {
+      "type": "proc_spawn",
+      "cmd": "./target/aarch64-apple-darwin/debug/stoar",
+      "args": ["--db", "/tmp/stoar_ns_host.db", "alias", "set", "nsq", "b", "sha256:3e744b9dc39389baf0c5a0660589b8402f3dbb49b89b3e75f2c9355852a3c677"],
+      "expect_exit": 1
+    },
+    {
+      "type": "proc_spawn",
+      "cmd": "./target/aarch64-apple-darwin/debug/stoar",
+      "args": ["--db", "/tmp/stoar_ns_host.db", "namespace", "set", "nsro", "--token", "nsro-token", "--read-only"],
+      "expect_exit": 0
+    },
+    {
+      "type": "proc_spawn",
+      "cmd": "./target/aarch64-apple-darwin/debug/stoar",
+      "args": ["--db", "/tmp/stoar_ns_host.db", "alias", "set", "nsro", "x", "sha256:9834876dcfb05cb167a5c24953eba58c4ac89b1adf57f28f2f9d09af107ee8f0"],
+      "expect_exit": 1
+    }
+  ]
+}

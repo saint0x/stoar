@@ -1,0 +1,76 @@
+{
+  "version": 1,
+  "name": "stoar-host-behavior",
+  "steps": [
+    {
+      "type": "proc_spawn",
+      "cmd": "rm",
+      "args": ["-f", "/tmp/stoar_fozzy_beh.db", "/tmp/stoar_fozzy_beh2.db", "/tmp/stoar_fozzy_sync.json"],
+      "expect_exit": 0
+    },
+    {
+      "type": "proc_spawn",
+      "cmd": "./target/aarch64-apple-darwin/debug/stoar",
+      "args": ["--db", "/tmp/stoar_fozzy_beh.db", "cas", "put", "Cargo.toml"],
+      "expect_exit": 0
+    },
+    {
+      "type": "proc_spawn",
+      "cmd": "./target/aarch64-apple-darwin/debug/stoar",
+      "args": ["--db", "/tmp/stoar_fozzy_beh.db", "cas", "put", "Cargo.toml"],
+      "expect_exit": 0
+    },
+    {
+      "type": "proc_spawn",
+      "cmd": "./target/aarch64-apple-darwin/debug/stoar",
+      "args": ["--db", "/tmp/stoar_fozzy_beh.db", "sql", "SELECT COUNT(*) FROM cas_objects", "--mode", "raw"],
+      "expect_exit": 0,
+      "expect_stdout": "1\n"
+    },
+    {
+      "type": "proc_spawn",
+      "cmd": "./target/aarch64-apple-darwin/debug/stoar",
+      "args": ["--db", "/tmp/stoar_fozzy_beh.db", "sql", "SELECT storage_kind FROM cas_objects", "--mode", "raw"],
+      "expect_exit": 0,
+      "expect_stdout": "inline\n"
+    },
+    {
+      "type": "proc_spawn",
+      "cmd": "./target/aarch64-apple-darwin/debug/stoar",
+      "args": ["--db", "/tmp/stoar_fozzy_beh.db", "alias", "set", "default", "cargo", "sha256:d2551d085b2f0087d1ebc54f9cae95476aca9947e57ef0faee947452c57207b6"],
+      "expect_exit": 0
+    },
+    {
+      "type": "proc_spawn",
+      "cmd": "./target/aarch64-apple-darwin/debug/stoar",
+      "args": ["--db", "/tmp/stoar_fozzy_beh.db", "sql", "SELECT version, content_id FROM cas_aliases WHERE namespace='default' AND alias='cargo'", "--mode", "raw"],
+      "expect_exit": 0,
+      "expect_stdout": "1\tsha256:d2551d085b2f0087d1ebc54f9cae95476aca9947e57ef0faee947452c57207b6\n"
+    },
+    {
+      "type": "proc_spawn",
+      "cmd": "./target/aarch64-apple-darwin/debug/stoar",
+      "args": ["--db", "/tmp/stoar_fozzy_beh.db", "verify", "sha256:d2551d085b2f0087d1ebc54f9cae95476aca9947e57ef0faee947452c57207b6"],
+      "expect_exit": 0
+    },
+    {
+      "type": "proc_spawn",
+      "cmd": "./target/aarch64-apple-darwin/debug/stoar",
+      "args": ["--db", "/tmp/stoar_fozzy_beh.db", "sync", "export", "/tmp/stoar_fozzy_sync.json"],
+      "expect_exit": 0
+    },
+    {
+      "type": "proc_spawn",
+      "cmd": "./target/aarch64-apple-darwin/debug/stoar",
+      "args": ["--db", "/tmp/stoar_fozzy_beh2.db", "sync", "import", "/tmp/stoar_fozzy_sync.json"],
+      "expect_exit": 0
+    },
+    {
+      "type": "proc_spawn",
+      "cmd": "./target/aarch64-apple-darwin/debug/stoar",
+      "args": ["--db", "/tmp/stoar_fozzy_beh2.db", "sql", "SELECT COUNT(*) FROM cas_objects", "--mode", "raw"],
+      "expect_exit": 0,
+      "expect_stdout": "1\n"
+    }
+  ]
+}

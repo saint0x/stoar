@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "name": "cas-core-sanity",
+  "steps": [
+    { "name": "start", "type": "trace_event" },
+    { "a": 1, "b": 1, "type": "assert_eq_int" }
+  ]
+}
