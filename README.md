@@ -1,151 +1,262 @@
 # stoar
 
-SQLite + object store in one file. Store JSON documents and binary blobs with a clean API. Ships as a Rust library or a 2.4MB CLI binary with zero runtime dependencies.
+SQLite-backed content-addressable storage with aliasing, namespace policy, and an optional CLI/HTTP server.
+
+`stoar` is a small Rust crate that stores immutable payloads by content hash and layers mutable references and tenancy controls on top. It can be embedded as a library or built with the `cli` feature to get a standalone `stoar` binary.
+
+## What It Does
+
+- Stores immutable objects by `sha256:<digest>`
+- Deduplicates identical content automatically
+- Stores small payloads inline in SQLite and large payloads in chunk rows
+- Exposes mutable aliases: `namespace + alias -> content_id`
+- Tracks refcounts and pin state for retention / garbage collection
+- Supports namespace policies: bearer token, read-only mode, object quota, byte quota
+- Verifies stored content against its digest
+- Exports/imports full CAS state for replication or migration
+- Can run as an HTTP service with admin and namespace-scoped auth
 
 ## Install
 
-### CLI binary
-
-```bash
-cargo build --release --features cli
-cp target/aarch64-apple-darwin/release/stoar /usr/local/bin/stoar
-```
-
-### Rust dependency
+### Library
 
 ```toml
 [dependencies]
 stoar = { path = "/path/to/stoar" }
 ```
 
-## CLI
+### CLI / Server Binary
 
 ```bash
-stoar --db app.db put users alice '{"name":"Alice","age":30}'
-stoar --db app.db get users alice
-stoar --db app.db delete users alice
-stoar --db app.db list users
-stoar --db app.db count users
-stoar --db app.db exists users alice
-stoar --db app.db query "SELECT data FROM [users] WHERE json_extract(data, '$.age') > ?" 25
-stoar --db app.db write photos/logo.png ./logo.png
-stoar --db app.db write photos/logo.png ./logo.png --mime image/png
-stoar --db app.db read photos/logo.png -o ./out.png
-stoar --db app.db meta photos/logo.png
-stoar --db app.db remove photos/logo.png
-stoar --db app.db collections
-stoar --db app.db blobs
-stoar --db app.db info
-stoar --db app.db open
+cargo build --release --features cli
+cp target/release/stoar /usr/local/bin/stoar
 ```
-
-Data goes to stdout (JSON), status messages to stderr. Non-zero exit on "not found" for scripting. Default database path is `stoar.db`.
 
 ## Library API
 
-### Structured Data
+### Open a Store
 
 ```rust
-use stoar::{Store, json};
+use stoar::Store;
 
-let store = Store::open("data.db")?;
+let store = Store::open("stoar.db")?;
+```
 
-store.put("users", "alice", &json!({"name": "Alice", "age": 30}))?;
-let user: Option<serde_json::Value> = store.get("users", "alice")?;
-store.delete("users", "alice")?;
+### Put and Get Content
 
-let all_users: Vec<User> = store.all("users")?;
-let count = store.count("users")?;
-let exists = store.exists("users", "alice")?;
+```rust
+let content_id = store.put_content(b"hello world", Some("text/plain"))?;
 
-let expensive: Vec<Product> = store.query(
-    "SELECT data FROM [products] WHERE json_extract(data, '$.price') > ?",
-    &[&50.0],
+let data = store.get_content(&content_id)?.expect("content exists");
+assert_eq!(data, b"hello world");
+```
+
+### Stream from a File
+
+```rust
+let content_id = store.put_content_file("./logo.png", Some("image/png"))?;
+```
+
+### Read Metadata
+
+```rust
+let meta = store.head_content(&content_id)?.expect("metadata exists");
+println!("{}", meta.size_bytes);
+println!("{}", meta.storage_kind);
+```
+
+### Aliases
+
+```rust
+let record = store.set_alias("images", "logo", &content_id, None)?;
+
+let resolved = store
+    .resolve_alias("images", "logo")?
+    .expect("alias exists");
+
+assert_eq!(record.content_id, resolved.content_id);
+```
+
+### Namespace Policy
+
+```rust
+store.upsert_namespace(
+    "images",
+    Some("secret-token"),
+    false,
+    Some(10_000),
+    Some(100 * 1024 * 1024),
+)?;
+
+store.attach_content_to_namespace("images", &content_id)?;
+assert!(store.namespace_has_content("images", &content_id)?);
+```
+
+### Retention and GC
+
+```rust
+store.inc_ref(&content_id)?;
+store.pin(&content_id)?;
+
+let dry_run = store.gc_run(true)?;
+println!("candidates: {}", dry_run.candidates);
+```
+
+### Verification
+
+```rust
+let result = store.verify_content(&content_id)?;
+assert!(result.ok);
+```
+
+### Snapshot and Sync
+
+```rust
+store.snapshot_create("backup.db")?;
+store.sync_export("replica-sync.json")?;
+store.sync_import("replica-sync.json")?;
+```
+
+### Raw SQL
+
+```rust
+let rows = store.query_sql(
+    "SELECT namespace, alias, content_id FROM cas_aliases WHERE namespace = ?",
+    &[&"images"],
 )?;
 ```
 
-### Blobs
+## CLI
 
-```rust
-store.write("files/photo.jpg", &bytes)?;
-store.write_with_meta("files/photo.jpg", &bytes, Some("image/jpeg"))?;
+The binary is feature-gated behind `--features cli`.
 
-let data: Option<Vec<u8>> = store.read("files/photo.jpg")?;
+### CAS
 
-if let Some(meta) = store.meta("files/photo.jpg")? {
-    // meta.size, meta.mime_type, meta.hash, meta.created_at, meta.updated_at
-}
-
-store.remove("files/photo.jpg")?;
+```bash
+stoar --db stoar.db cas put ./logo.png --mime image/png
+stoar --db stoar.db cas get sha256:... -o ./logo.png
+stoar --db stoar.db cas head sha256:...
 ```
 
-### Transactions
+### Aliases
 
-```rust
-store.tx(|tx| {
-    tx.put("users", "bob", &user)?;
-    tx.write("docs/file.pdf", &pdf_bytes)?;
-    let count = tx.count("users")?;
-    Ok(count)
-})?;
-// Commits on Ok, rolls back on Err
+```bash
+stoar --db stoar.db alias set images logo sha256:...
+stoar --db stoar.db alias get images logo
+stoar --db stoar.db alias delete images logo
 ```
 
-### Metadata
+### Refs, Pinning, GC, Verify
 
-```rust
-store.instance_id()    // Unique UUID per store instance
-store.collections()?   // List all user-created collections
-store.blobs()?         // List all blobs with metadata
-store.info()?          // Database metadata (instance_id, schema_version, initialized_at)
+```bash
+stoar --db stoar.db ref inc sha256:...
+stoar --db stoar.db ref pin sha256:...
+stoar --db stoar.db gc run --dry-run
+stoar --db stoar.db verify sha256:...
+stoar --db stoar.db verify --all
 ```
 
-## Architecture
+### Namespace Management
 
-Single SQLite file. WAL journal mode, NORMAL synchronous, 10K page cache, foreign keys on.
+```bash
+stoar --db stoar.db namespace set images --token secret --max-objects 1000 --max-bytes 104857600
+stoar --db stoar.db namespace get images
+stoar --db stoar.db namespace list
+```
 
-**Schema:**
-- `__meta` — instance_id, schema_version, initialized_at
-- `__objects` — key, data (BLOB), mime_type, size, hash, created_at, updated_at
-- `[collection_name]` — key, data (JSON as TEXT). Created on first `put()`.
+### SQL / Snapshot / Sync
 
-**Thread safety:** `Mutex<Connection>`. Single writer, serialized access.
+```bash
+stoar --db stoar.db sql "SELECT * FROM cas_aliases" --mode json
+stoar --db stoar.db snapshot create ./snapshot.db
+stoar --db stoar.db sync export ./sync.json
+stoar --db stoar.db sync import ./sync.json
+```
 
-**Key constraints:** Non-empty, max 1024 bytes. Validated on every operation.
+## HTTP Server
 
-**Schema initialization:** Eager on `open()` / `memory()`. Reads on a fresh database return `None`, not errors.
+Build with `--features cli` and run:
+
+```bash
+stoar --db stoar.db serve --listen 127.0.0.1:7777 --token admin-token
+```
+
+HTTP surface:
+
+- Admin routes:
+  - `POST /cas`
+  - `GET /cas/:content_id`
+  - `GET /cas/:content_id/head`
+  - `POST|GET|DELETE /alias/:namespace/:alias`
+  - `POST /ref/:action/:content_id`
+  - `POST /gc`
+  - `POST /verify`
+  - `POST /sql`
+  - `GET /admin/namespaces`
+  - `POST /admin/namespace/:namespace`
+- Namespace-scoped routes:
+  - `POST /ns/:namespace/cas`
+  - `GET /ns/:namespace/cas/:content_id`
+  - `GET /ns/:namespace/cas/:content_id/head`
+  - `POST|GET /ns/:namespace/alias/:alias`
+  - `POST /ns/:namespace/ref/:action/:content_id`
+  - `POST /ns/:namespace/verify`
+- Utility:
+  - `GET /healthz`
+  - `GET /readyz`
+  - `GET /metrics`
+
+Auth model:
+
+- Admin routes require `Authorization: Bearer <admin-token>`
+- Namespace routes accept either the admin token or that namespace's configured token
+- Namespace write operations are blocked when the namespace is read-only
+
+## Storage Model
+
+The schema is initialized eagerly on `open()` / `memory()` and currently includes:
+
+- `__meta`
+- `cas_objects`
+- `cas_object_chunks`
+- `cas_aliases`
+- `cas_namespaces`
+- `cas_namespace_objects`
+- `cas_refs`
+- `cas_gc_log`
+- `cas_sql_audit`
+
+Storage strategy:
+
+- Payloads up to 1 MiB are stored inline in `cas_objects.inline_blob`
+- Larger payloads are split into 1 MiB chunks in `cas_object_chunks`
+- `content_id` is canonical and content-addressed
+- Alias rows provide mutable names without changing immutable content rows
+
+SQLite connection settings:
+
+- WAL journal mode
+- `synchronous = NORMAL`
+- foreign keys enabled
+- pooled connections via `r2d2_sqlite`
 
 ## Build
 
 ```bash
-cargo build --release                  # Library only
-cargo build --release --features cli   # Library + CLI binary
-cargo test                             # 34 tests
+cargo build --release
+cargo build --release --features cli
 ```
 
-Release binary: 2.4MB, LTO, single codegen unit, stripped symbols. SQLite statically linked via `bundled` feature.
-
-## Performance
-
-| Operation | Time |
-|-----------|------|
-| Store init | 1.5-2.4ms |
-| PUT (JSON) | 0.8-1.7ms |
-| GET (JSON) | 0.06-0.07ms |
-| EXISTS | 0.02-0.04ms |
-| DELETE | 0.04-0.31ms |
-| COUNT | 0.02ms |
-| QUERY (filtered) | 0.1ms |
-| TX (2 ops) | 0.08ms |
-| TX (4 ops) | 0.4ms |
-| WRITE (2.74MB blob) | 15-32ms |
-| READ (2.74MB blob) | 0.5-1ms |
-| META | 0.08-0.2ms |
-
-## Tests
+## Test
 
 ```bash
 cargo test
 ```
 
-34 tests covering: schema initialization, structured data CRUD, blob operations, transactions (commit + rollback), key validation, collection isolation, and edge cases. All in-memory, no filesystem side effects.
+The current repository test suite is small and focused on core CAS behavior:
+
+- deduplication
+- alias refcount updates
+- verification and range reads
+- garbage collection
+- sync export/import roundtrip
