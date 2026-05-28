@@ -37,7 +37,7 @@
     {
       "type": "proc_spawn",
       "cmd": "./target/aarch64-apple-darwin/debug/stoar",
-      "args": ["--db", "/tmp/stoar_fozzy_beh.db", "alias", "set", "default", "cargo", "sha256:d2551d085b2f0087d1ebc54f9cae95476aca9947e57ef0faee947452c57207b6"],
+      "args": ["--db", "/tmp/stoar_fozzy_beh.db", "alias", "set", "default", "cargo", "sha256:9bf02d81ce99a2652d7d5e64b928a44de0b4f3a1be43bcaf9da1d1ad2854ee4f"],
       "expect_exit": 0
     },
     {
@@ -45,12 +45,12 @@
       "cmd": "./target/aarch64-apple-darwin/debug/stoar",
       "args": ["--db", "/tmp/stoar_fozzy_beh.db", "sql", "SELECT version, content_id FROM cas_aliases WHERE namespace='default' AND alias='cargo'", "--mode", "raw"],
       "expect_exit": 0,
-      "expect_stdout": "1\tsha256:d2551d085b2f0087d1ebc54f9cae95476aca9947e57ef0faee947452c57207b6\n"
+      "expect_stdout": "1\tsha256:9bf02d81ce99a2652d7d5e64b928a44de0b4f3a1be43bcaf9da1d1ad2854ee4f\n"
     },
     {
       "type": "proc_spawn",
       "cmd": "./target/aarch64-apple-darwin/debug/stoar",
-      "args": ["--db", "/tmp/stoar_fozzy_beh.db", "verify", "sha256:d2551d085b2f0087d1ebc54f9cae95476aca9947e57ef0faee947452c57207b6"],
+      "args": ["--db", "/tmp/stoar_fozzy_beh.db", "verify", "sha256:9bf02d81ce99a2652d7d5e64b928a44de0b4f3a1be43bcaf9da1d1ad2854ee4f"],
       "expect_exit": 0
     },
     {

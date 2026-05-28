@@ -15,7 +15,8 @@ pub mod store;
 
 pub use error::{Result, StoreError};
 pub use store::{
-    AliasRecord, ContentMeta, GcReport, NamespaceConfig, SqlRows, Store, VerifyResult,
+    AliasRecord, ContentMeta, GcReport, NamespaceConfig, ObjectRecord, SqlRows, Store, StoreInfo,
+    VerifyResult,
 };
 
 pub use serde::{Deserialize, Serialize};

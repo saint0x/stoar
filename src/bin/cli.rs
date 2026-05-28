@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use stoar::{AliasRecord, NamespaceConfig, SqlRows, Store};
+use stoar::{AliasRecord, NamespaceConfig, ObjectRecord, SqlRows, Store};
 use tokio::io::AsyncWriteExt;
 
 #[derive(Parser)]
@@ -27,6 +27,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    Info,
+    Collections,
+    Doc {
+        #[command(subcommand)]
+        command: DocCommand,
+    },
+    Object {
+        #[command(subcommand)]
+        command: ObjectCommand,
+    },
     Sql {
         sql: String,
         params: Vec<String>,
@@ -73,6 +83,73 @@ enum Command {
         token: String,
         #[arg(long, default_value_t = false)]
         allow_sql_mutations: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum DocCommand {
+    Put {
+        collection: String,
+        key: String,
+        json: String,
+    },
+    Get {
+        collection: String,
+        key: String,
+    },
+    Delete {
+        collection: String,
+        key: String,
+    },
+    List {
+        collection: String,
+    },
+    Count {
+        collection: String,
+    },
+    Exists {
+        collection: String,
+        key: String,
+    },
+    All {
+        collection: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ObjectCommand {
+    Put {
+        namespace: String,
+        key: String,
+        input: String,
+        #[arg(long)]
+        mime: Option<String>,
+        #[arg(long)]
+        expected_version: Option<i64>,
+    },
+    Get {
+        namespace: String,
+        key: String,
+        #[arg(long, short)]
+        output: Option<PathBuf>,
+        #[arg(long)]
+        offset: Option<usize>,
+        #[arg(long)]
+        length: Option<usize>,
+    },
+    Head {
+        namespace: String,
+        key: String,
+    },
+    Delete {
+        namespace: String,
+        key: String,
+    },
+    List {
+        #[arg(long)]
+        namespace: Option<String>,
+        #[arg(long)]
+        prefix: Option<String>,
     },
 }
 
@@ -208,6 +285,17 @@ struct GcQuery {
     dry_run: Option<bool>,
 }
 
+#[derive(Deserialize)]
+struct ObjectListQuery {
+    namespace: Option<String>,
+    prefix: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ObjectPutQuery {
+    expected_version: Option<i64>,
+}
+
 #[derive(Serialize)]
 struct Health {
     ok: bool,
@@ -231,6 +319,134 @@ async fn run(cli: Cli) -> stoar::Result<()> {
     let store = Store::open(&cli.db)?;
 
     match cli.command {
+        Command::Info => {
+            println!("{}", serde_json::to_string_pretty(&store.info()?)?);
+        }
+        Command::Collections => {
+            println!("{}", serde_json::to_string_pretty(&store.collections()?)?);
+        }
+        Command::Doc { command } => match command {
+            DocCommand::Put {
+                collection,
+                key,
+                json,
+            } => {
+                let payload = read_json_arg(&json)?;
+                store.put_value(&collection, &key, &payload)?;
+            }
+            DocCommand::Get { collection, key } => match store.get_value(&collection, &key)? {
+                Some(value) => println!("{}", serde_json::to_string_pretty(&value)?),
+                None => {
+                    eprintln!("not found: {collection}/{key}");
+                    std::process::exit(1);
+                }
+            },
+            DocCommand::Delete { collection, key } => {
+                if !store.delete(&collection, &key)? {
+                    eprintln!("not found: {collection}/{key}");
+                    std::process::exit(1);
+                }
+            }
+            DocCommand::List { collection } => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&store.list(&collection)?)?
+                );
+            }
+            DocCommand::Count { collection } => {
+                println!("{}", store.count(&collection)?);
+            }
+            DocCommand::Exists { collection, key } => {
+                let exists = store.exists(&collection, &key)?;
+                println!("{exists}");
+                if !exists {
+                    std::process::exit(1);
+                }
+            }
+            DocCommand::All { collection } => {
+                let rows = store
+                    .all_values(&collection)?
+                    .into_iter()
+                    .map(|(key, data)| serde_json::json!({"key": key, "data": data}))
+                    .collect::<Vec<_>>();
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            }
+        },
+        Command::Object { command } => match command {
+            ObjectCommand::Put {
+                namespace,
+                key,
+                input,
+                mime,
+                expected_version,
+            } => {
+                let out = if input == "-" {
+                    let mut stdin = std::io::stdin();
+                    let bytes = read_all(&mut stdin)?;
+                    store.put_object(&namespace, &key, &bytes, mime.as_deref(), expected_version)?
+                } else {
+                    store.put_object_file(
+                        &namespace,
+                        &key,
+                        input,
+                        mime.as_deref(),
+                        expected_version,
+                    )?
+                };
+                print_object(&out)?;
+            }
+            ObjectCommand::Get {
+                namespace,
+                key,
+                output,
+                offset,
+                length,
+            } => {
+                let mut writer: Box<dyn Write> = if let Some(path) = output {
+                    Box::new(std::fs::File::create(path)?)
+                } else {
+                    Box::new(std::io::stdout())
+                };
+                let data = if offset.is_some() || length.is_some() {
+                    store.read_object_range(
+                        &namespace,
+                        &key,
+                        offset.unwrap_or(0),
+                        length.unwrap_or(usize::MAX),
+                    )?
+                } else {
+                    store.get_object(&namespace, &key)?
+                };
+                match data {
+                    Some(bytes) => writer.write_all(&bytes)?,
+                    None => {
+                        eprintln!("not found: {namespace}/{key}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            ObjectCommand::Head { namespace, key } => match store.head_object(&namespace, &key)? {
+                Some(value) => print_object(&value)?,
+                None => {
+                    eprintln!("not found: {namespace}/{key}");
+                    std::process::exit(1);
+                }
+            },
+            ObjectCommand::Delete { namespace, key } => {
+                if !store.delete_object(&namespace, &key)? {
+                    eprintln!("not found: {namespace}/{key}");
+                    std::process::exit(1);
+                }
+            }
+            ObjectCommand::List { namespace, prefix } => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &store.list_objects(namespace.as_deref(), prefix.as_deref())?
+                    )?
+                );
+            }
+        },
         Command::Sql { sql, params, mode } => run_sql(&store, &sql, params, mode)?,
         Command::Cas { command } => match command {
             CasCommand::Put { input, mime } => {
@@ -418,6 +634,21 @@ fn run_sql(store: &Store, sql: &str, params: Vec<String>, mode: SqlMode) -> stoa
     Ok(())
 }
 
+fn read_json_arg(input: &str) -> stoar::Result<serde_json::Value> {
+    if input == "-" {
+        let mut stdin = std::io::stdin();
+        let bytes = read_all(&mut stdin)?;
+        return Ok(serde_json::from_slice(&bytes)?);
+    }
+    Ok(serde_json::from_str(input)?)
+}
+
+fn read_all<R: std::io::Read>(reader: &mut R) -> stoar::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    reader.read_to_end(&mut out)?;
+    Ok(out)
+}
+
 async fn serve(
     store: Arc<Store>,
     listen: String,
@@ -436,6 +667,20 @@ async fn serve(
         .route("/healthz", get(health))
         .route("/readyz", get(health))
         .route("/metrics", get(metrics))
+        .route("/docs", get(collections_http))
+        .route("/docs/:collection", get(collection_all_http))
+        .route(
+            "/docs/:collection/:key",
+            get(doc_get_http).post(doc_put_http).delete(doc_delete_http),
+        )
+        .route("/objects", get(objects_list_http))
+        .route(
+            "/objects/:namespace/*key",
+            get(object_get_http)
+                .post(object_put_http)
+                .delete(object_delete_http),
+        )
+        .route("/objects/:namespace/*key/head", get(object_head_http))
         .route("/cas", post(admin_cas_put_http))
         .route("/cas/:content_id", get(admin_cas_get_http))
         .route("/cas/:content_id/head", get(admin_cas_head_http))
@@ -493,6 +738,211 @@ async fn metrics(State(state): State<AppState>) -> String {
         state.requests_total.load(Ordering::Relaxed),
         state.auth_failures_total.load(Ordering::Relaxed),
     )
+}
+
+fn print_object(record: &ObjectRecord) -> stoar::Result<()> {
+    println!("{}", serde_json::to_string_pretty(record)?);
+    Ok(())
+}
+
+async fn collections_http(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    state.requests_total.fetch_add(1, Ordering::Relaxed);
+    if let Err(resp) = authorize_admin(&state, &headers) {
+        return resp;
+    }
+
+    match state.store.collections() {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+    }
+}
+
+async fn collection_all_http(
+    State(state): State<AppState>,
+    AxumPath(collection): AxumPath<String>,
+    headers: HeaderMap,
+) -> Response {
+    state.requests_total.fetch_add(1, Ordering::Relaxed);
+    if let Err(resp) = authorize_admin(&state, &headers) {
+        return resp;
+    }
+
+    match state.store.all_values(&collection) {
+        Ok(rows) => Json(
+            rows.into_iter()
+                .map(|(key, data)| serde_json::json!({"key": key, "data": data}))
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
+    }
+}
+
+async fn doc_get_http(
+    State(state): State<AppState>,
+    AxumPath((collection, key)): AxumPath<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    state.requests_total.fetch_add(1, Ordering::Relaxed);
+    if let Err(resp) = authorize_admin(&state, &headers) {
+        return resp;
+    }
+
+    match state.store.get_value(&collection, &key) {
+        Ok(Some(value)) => Json(value).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
+    }
+}
+
+async fn doc_put_http(
+    State(state): State<AppState>,
+    AxumPath((collection, key)): AxumPath<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    state.requests_total.fetch_add(1, Ordering::Relaxed);
+    if let Err(resp) = authorize_admin(&state, &headers) {
+        return resp;
+    }
+
+    match state.store.put_value(&collection, &key, &body) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
+    }
+}
+
+async fn doc_delete_http(
+    State(state): State<AppState>,
+    AxumPath((collection, key)): AxumPath<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    state.requests_total.fetch_add(1, Ordering::Relaxed);
+    if let Err(resp) = authorize_admin(&state, &headers) {
+        return resp;
+    }
+
+    match state.store.delete(&collection, &key) {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
+    }
+}
+
+async fn objects_list_http(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    query: Query<ObjectListQuery>,
+) -> Response {
+    state.requests_total.fetch_add(1, Ordering::Relaxed);
+    if let Err(resp) = authorize_admin(&state, &headers) {
+        return resp;
+    }
+
+    match state
+        .store
+        .list_objects(query.namespace.as_deref(), query.prefix.as_deref())
+    {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
+    }
+}
+
+async fn object_get_http(
+    State(state): State<AppState>,
+    AxumPath((namespace, key)): AxumPath<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    state.requests_total.fetch_add(1, Ordering::Relaxed);
+    if let Err(resp) = authorize_admin(&state, &headers) {
+        return resp;
+    }
+
+    match state.store.get_object(&namespace, &key) {
+        Ok(Some(bytes)) => bytes.into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
+    }
+}
+
+async fn object_put_http(
+    State(state): State<AppState>,
+    AxumPath((namespace, key)): AxumPath<(String, String)>,
+    headers: HeaderMap,
+    query: Query<ObjectPutQuery>,
+    body: Body,
+) -> Response {
+    state.requests_total.fetch_add(1, Ordering::Relaxed);
+    if let Err(resp) = authorize_admin(&state, &headers) {
+        return resp;
+    }
+
+    let mime = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let temp_path = match stream_body_to_temp_file(body).await {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+
+    let store = state.store.clone();
+    let mime_owned = mime.clone();
+    match tokio::task::spawn_blocking(move || -> stoar::Result<ObjectRecord> {
+        let object = store.put_object_file(
+            &namespace,
+            &key,
+            &temp_path,
+            mime_owned.as_deref(),
+            query.expected_version,
+        )?;
+        let _ = std::fs::remove_file(&temp_path);
+        Ok(object)
+    })
+    .await
+    {
+        Ok(Ok(object)) => Json(object).into_response(),
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("upload join error: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn object_head_http(
+    State(state): State<AppState>,
+    AxumPath((namespace, key)): AxumPath<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    state.requests_total.fetch_add(1, Ordering::Relaxed);
+    if let Err(resp) = authorize_admin(&state, &headers) {
+        return resp;
+    }
+
+    match state.store.head_object(&namespace, &key) {
+        Ok(Some(object)) => Json(object).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
+    }
+}
+
+async fn object_delete_http(
+    State(state): State<AppState>,
+    AxumPath((namespace, key)): AxumPath<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    state.requests_total.fetch_add(1, Ordering::Relaxed);
+    if let Err(resp) = authorize_admin(&state, &headers) {
+        return resp;
+    }
+
+    match state.store.delete_object(&namespace, &key) {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
+    }
 }
 
 async fn admin_cas_put_http(

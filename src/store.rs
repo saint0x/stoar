@@ -2,6 +2,7 @@ use base64::Engine;
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{params, types::ValueRef, Connection, OptionalExtension};
+use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 use std::io::{Read, Write};
@@ -42,6 +43,19 @@ pub struct ContentMeta {
     pub created_at: i64,
     /// Last successful verify timestamp (unix seconds).
     pub verified_at: Option<i64>,
+}
+
+/// High-level metadata about a store instance.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StoreInfo {
+    /// Stable database-scoped instance identifier persisted in `__meta`.
+    pub instance_id: String,
+    /// Store schema version.
+    pub schema_version: i64,
+    /// Store initialization timestamp (RFC 3339).
+    pub initialized_at: String,
+    /// Database path when file-backed.
+    pub db_path: Option<String>,
 }
 
 /// Alias record mapping a logical name to a content id.
@@ -98,6 +112,31 @@ pub struct NamespaceConfig {
     pub created_at: i64,
     /// Updated-at unix timestamp.
     pub updated_at: i64,
+}
+
+/// Metadata about an object alias stored in the object API.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ObjectRecord {
+    /// Object namespace, similar to a bucket or tenant.
+    pub namespace: String,
+    /// Object key within the namespace.
+    pub key: String,
+    /// Canonical content identifier for the current object payload.
+    pub content_id: String,
+    /// Monotonic alias version.
+    pub version: i64,
+    /// Object payload size in bytes.
+    pub size_bytes: i64,
+    /// Optional MIME type from ingest.
+    pub mime_type: Option<String>,
+    /// Storage layout.
+    pub storage_kind: String,
+    /// Content creation timestamp.
+    pub created_at: i64,
+    /// Alias update timestamp.
+    pub updated_at: i64,
+    /// Last successful verify timestamp.
+    pub verified_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -165,12 +204,15 @@ impl Store {
             Self::configure_connection(&conn)?;
         }
 
-        let store = Self {
+        let mut store = Self {
             pool,
             db_path: Some(db_path),
             instance_id: Uuid::new_v4().to_string(),
         };
         store.init_schema()?;
+        store.instance_id = store.load_meta_value("instance_id")?.ok_or_else(|| {
+            StoreError::InvalidConfig("missing instance_id in __meta".to_string())
+        })?;
         Ok(store)
     }
 
@@ -189,12 +231,15 @@ impl Store {
             Self::configure_connection(&conn)?;
         }
 
-        let store = Self {
+        let mut store = Self {
             pool,
             db_path: None,
             instance_id: Uuid::new_v4().to_string(),
         };
         store.init_schema()?;
+        store.instance_id = store.load_meta_value("instance_id")?.ok_or_else(|| {
+            StoreError::InvalidConfig("missing instance_id in __meta".to_string())
+        })?;
         Ok(store)
     }
 
@@ -202,6 +247,251 @@ impl Store {
     #[inline]
     pub fn instance_id(&self) -> &str {
         &self.instance_id
+    }
+
+    /// Return persisted store metadata from `__meta`.
+    pub fn info(&self) -> Result<StoreInfo> {
+        let schema_version = self
+            .load_meta_value("schema_version")?
+            .ok_or_else(|| {
+                StoreError::InvalidConfig("missing schema_version in __meta".to_string())
+            })?
+            .parse::<i64>()
+            .map_err(|e| {
+                StoreError::InvalidConfig(format!("invalid schema_version in __meta: {e}"))
+            })?;
+        let initialized_at = self.load_meta_value("initialized_at")?.ok_or_else(|| {
+            StoreError::InvalidConfig("missing initialized_at in __meta".to_string())
+        })?;
+
+        Ok(StoreInfo {
+            instance_id: self.instance_id.clone(),
+            schema_version,
+            initialized_at,
+            db_path: self
+                .db_path()
+                .map(|path| path.to_string_lossy().to_string()),
+        })
+    }
+
+    /// List user collections stored as JSON document tables.
+    pub fn collections(&self) -> Result<Vec<String>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT name
+             FROM sqlite_master
+             WHERE type = 'table'
+               AND name NOT GLOB 'sqlite_*'
+               AND name NOT GLOB 'cas_*'
+               AND name NOT GLOB '__*'
+             ORDER BY name",
+        )?;
+        let out = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(out)
+    }
+
+    /// Put a JSON-serializable document into a collection.
+    pub fn put<T: serde::Serialize>(&self, collection: &str, key: &str, value: &T) -> Result<()> {
+        let json = serde_json::to_value(value)?;
+        self.put_value(collection, key, &json)
+    }
+
+    /// Put a raw JSON value into a collection.
+    pub fn put_value(&self, collection: &str, key: &str, value: &serde_json::Value) -> Result<()> {
+        validate_collection_name(collection)?;
+        validate_key(key, "key")?;
+
+        let collection_sql = quote_identifier(collection);
+        let payload = serde_json::to_string(value)?;
+        let now = chrono::Utc::now().timestamp();
+
+        self.with_tx(|tx| {
+            ensure_collection_exists_tx(tx, collection)?;
+            let _ = tx.execute(
+                &format!(
+                    "INSERT INTO {collection_sql} (key, data, created_at, updated_at)
+                     VALUES (?, ?, ?, ?)
+                     ON CONFLICT(key)
+                     DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at"
+                ),
+                params![key, payload, now, now],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Get a typed document from a collection by key.
+    pub fn get<T: DeserializeOwned>(&self, collection: &str, key: &str) -> Result<Option<T>> {
+        let value = match self.get_value(collection, key)? {
+            Some(value) => value,
+            None => return Ok(None),
+        };
+        let out = serde_json::from_value(value)?;
+        Ok(Some(out))
+    }
+
+    /// Get a raw JSON value from a collection by key.
+    pub fn get_value(&self, collection: &str, key: &str) -> Result<Option<serde_json::Value>> {
+        validate_collection_name(collection)?;
+        validate_key(key, "key")?;
+
+        let conn = self.conn()?;
+        if !collection_exists_conn(&conn, collection)? {
+            return Ok(None);
+        }
+
+        let collection_sql = quote_identifier(collection);
+        let data: Option<String> = conn
+            .query_row(
+                &format!("SELECT data FROM {collection_sql} WHERE key = ?"),
+                [key],
+                |r| r.get(0),
+            )
+            .optional()?;
+
+        data.map(|json| serde_json::from_str(&json))
+            .transpose()
+            .map_err(StoreError::from)
+    }
+
+    /// Delete a document by key. Returns `true` when a row was deleted.
+    pub fn delete(&self, collection: &str, key: &str) -> Result<bool> {
+        validate_collection_name(collection)?;
+        validate_key(key, "key")?;
+
+        let conn = self.conn()?;
+        if !collection_exists_conn(&conn, collection)? {
+            return Ok(false);
+        }
+
+        let collection_sql = quote_identifier(collection);
+        let changed = conn.execute(
+            &format!("DELETE FROM {collection_sql} WHERE key = ?"),
+            params![key],
+        )?;
+        Ok(changed != 0)
+    }
+
+    /// Check whether a document exists.
+    pub fn exists(&self, collection: &str, key: &str) -> Result<bool> {
+        validate_collection_name(collection)?;
+        validate_key(key, "key")?;
+
+        let conn = self.conn()?;
+        if !collection_exists_conn(&conn, collection)? {
+            return Ok(false);
+        }
+
+        let collection_sql = quote_identifier(collection);
+        let exists: i64 = conn.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM {collection_sql} WHERE key = ?)"),
+            params![key],
+            |r| r.get(0),
+        )?;
+        Ok(exists != 0)
+    }
+
+    /// Count documents in a collection.
+    pub fn count(&self, collection: &str) -> Result<i64> {
+        validate_collection_name(collection)?;
+
+        let conn = self.conn()?;
+        if !collection_exists_conn(&conn, collection)? {
+            return Ok(0);
+        }
+
+        let collection_sql = quote_identifier(collection);
+        let count = conn.query_row(&format!("SELECT COUNT(*) FROM {collection_sql}"), [], |r| {
+            r.get(0)
+        })?;
+        Ok(count)
+    }
+
+    /// List document keys in a collection in key order.
+    pub fn list(&self, collection: &str) -> Result<Vec<String>> {
+        validate_collection_name(collection)?;
+
+        let conn = self.conn()?;
+        if !collection_exists_conn(&conn, collection)? {
+            return Ok(Vec::new());
+        }
+
+        let collection_sql = quote_identifier(collection);
+        let mut stmt = conn.prepare(&format!(
+            "SELECT key FROM {collection_sql} ORDER BY key ASC"
+        ))?;
+        let out = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(out)
+    }
+
+    /// Return all raw JSON documents in a collection along with their keys.
+    pub fn all_values(&self, collection: &str) -> Result<Vec<(String, serde_json::Value)>> {
+        validate_collection_name(collection)?;
+
+        let conn = self.conn()?;
+        if !collection_exists_conn(&conn, collection)? {
+            return Ok(Vec::new());
+        }
+
+        let collection_sql = quote_identifier(collection);
+        let mut stmt = conn.prepare(&format!(
+            "SELECT key, data FROM {collection_sql} ORDER BY key ASC"
+        ))?;
+        let rows = stmt
+            .query_map([], |r| {
+                let key: String = r.get(0)?;
+                let data: String = r.get(1)?;
+                let value = serde_json::from_str(&data).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
+                Ok((key, value))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Return all typed documents in a collection.
+    pub fn all<T: DeserializeOwned>(&self, collection: &str) -> Result<Vec<T>> {
+        self.all_values(collection)?
+            .into_iter()
+            .map(|(_, value)| serde_json::from_value(value).map_err(StoreError::from))
+            .collect()
+    }
+
+    /// Run a SQL query whose first column is JSON and deserialize each row.
+    pub fn query<T: DeserializeOwned>(
+        &self,
+        sql: &str,
+        params: &[&dyn rusqlite::ToSql],
+    ) -> Result<Vec<T>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(sql)?;
+        let mut rows = stmt.query(params)?;
+        let mut out = Vec::new();
+
+        while let Some(row) = rows.next()? {
+            let value = match row.get_ref(0)? {
+                ValueRef::Text(text) => serde_json::from_slice(text)?,
+                ValueRef::Blob(blob) => serde_json::from_slice(blob)?,
+                ValueRef::Null => serde_json::Value::Null,
+                other => {
+                    return Err(StoreError::InvalidConfig(format!(
+                        "query() expects JSON text/blob in column 0, got {other:?}"
+                    )))
+                }
+            };
+            out.push(serde_json::from_value(value)?);
+        }
+
+        Ok(out)
     }
 
     /// Execute SQL that does not return rows.
@@ -438,6 +728,111 @@ impl Store {
         let result = self.put_content_file(&temp, mime_type);
         let _ = std::fs::remove_file(&temp);
         result
+    }
+
+    /// Put or replace an object alias backed by deduplicated CAS content.
+    pub fn put_object(
+        &self,
+        namespace: &str,
+        key: &str,
+        data: &[u8],
+        mime_type: Option<&str>,
+        expected_version: Option<i64>,
+    ) -> Result<ObjectRecord> {
+        let content_id = self.put_content(data, mime_type)?;
+        let alias = self.set_alias(namespace, key, &content_id, expected_version)?;
+        self.object_record_from_alias(alias)
+    }
+
+    /// Put or replace an object alias from a file.
+    pub fn put_object_file<P: AsRef<Path>>(
+        &self,
+        namespace: &str,
+        key: &str,
+        path: P,
+        mime_type: Option<&str>,
+        expected_version: Option<i64>,
+    ) -> Result<ObjectRecord> {
+        let content_id = self.put_content_file(path, mime_type)?;
+        let alias = self.set_alias(namespace, key, &content_id, expected_version)?;
+        self.object_record_from_alias(alias)
+    }
+
+    /// Read object bytes by namespace and key.
+    pub fn get_object(&self, namespace: &str, key: &str) -> Result<Option<Vec<u8>>> {
+        let Some(alias) = self.resolve_alias(namespace, key)? else {
+            return Ok(None);
+        };
+        self.get_content(&alias.content_id)
+    }
+
+    /// Read an object byte range by namespace and key.
+    pub fn read_object_range(
+        &self,
+        namespace: &str,
+        key: &str,
+        offset: usize,
+        length: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(alias) = self.resolve_alias(namespace, key)? else {
+            return Ok(None);
+        };
+        self.read_range(&alias.content_id, offset, length)
+    }
+
+    /// Head object metadata by namespace and key.
+    pub fn head_object(&self, namespace: &str, key: &str) -> Result<Option<ObjectRecord>> {
+        let Some(alias) = self.resolve_alias(namespace, key)? else {
+            return Ok(None);
+        };
+        self.object_record_from_alias(alias).map(Some)
+    }
+
+    /// Delete an object alias. Underlying CAS data remains until GC if unreferenced.
+    pub fn delete_object(&self, namespace: &str, key: &str) -> Result<bool> {
+        self.remove_alias(namespace, key)
+    }
+
+    /// List objects, optionally filtered by namespace and/or key prefix.
+    pub fn list_objects(
+        &self,
+        namespace: Option<&str>,
+        prefix: Option<&str>,
+    ) -> Result<Vec<ObjectRecord>> {
+        if let Some(ns) = namespace {
+            validate_key(ns, "namespace")?;
+        }
+        if let Some(pref) = prefix {
+            validate_key(pref, "prefix")?;
+        }
+
+        let conn = self.conn()?;
+        let sql = "
+            SELECT a.namespace, a.alias, a.content_id, a.version, o.size_bytes, o.mime_type,
+                   o.storage_kind, o.created_at, a.updated_at, o.verified_at
+            FROM cas_aliases a
+            JOIN cas_objects o ON o.content_id = a.content_id
+            WHERE (?1 IS NULL OR a.namespace = ?1)
+              AND (?2 IS NULL OR a.alias LIKE (?2 || '%'))
+            ORDER BY a.namespace ASC, a.alias ASC";
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt
+            .query_map(params![namespace, prefix], |r| {
+                Ok(ObjectRecord {
+                    namespace: r.get(0)?,
+                    key: r.get(1)?,
+                    content_id: r.get(2)?,
+                    version: r.get(3)?,
+                    size_bytes: r.get(4)?,
+                    mime_type: r.get(5)?,
+                    storage_kind: r.get(6)?,
+                    created_at: r.get(7)?,
+                    updated_at: r.get(8)?,
+                    verified_at: r.get(9)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Get full content payload by content id.
@@ -1340,9 +1735,12 @@ impl Store {
     }
 
     fn conn(&self) -> Result<r2d2::PooledConnection<SqliteConnectionManager>> {
-        self.pool
+        let conn = self
+            .pool
             .get()
-            .map_err(|e| StoreError::InvalidConfig(format!("pool get failed: {e}")))
+            .map_err(|e| StoreError::InvalidConfig(format!("pool get failed: {e}")))?;
+        Self::configure_connection(&conn)?;
+        Ok(conn)
     }
 
     fn with_tx<T, F>(&self, f: F) -> Result<T>
@@ -1407,6 +1805,38 @@ impl Store {
             params![now, actor, sql, params_json, changed_rows],
         )?;
         Ok(())
+    }
+
+    fn load_meta_value(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.conn()?;
+        let value = conn
+            .query_row("SELECT value FROM __meta WHERE key = ?", [key], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        Ok(value)
+    }
+
+    fn object_record_from_alias(&self, alias: AliasRecord) -> Result<ObjectRecord> {
+        let meta = self.head_content(&alias.content_id)?.ok_or_else(|| {
+            StoreError::InvalidConfig(format!(
+                "alias points to missing content_id: {}",
+                alias.content_id
+            ))
+        })?;
+
+        Ok(ObjectRecord {
+            namespace: alias.namespace,
+            key: alias.alias,
+            content_id: alias.content_id,
+            version: alias.version,
+            size_bytes: meta.size_bytes,
+            mime_type: meta.mime_type,
+            storage_kind: meta.storage_kind,
+            created_at: meta.created_at,
+            updated_at: alias.updated_at,
+            verified_at: meta.verified_at,
+        })
     }
 }
 
@@ -1503,6 +1933,34 @@ fn ensure_namespace_exists_tx(
     Ok(())
 }
 
+fn ensure_collection_exists_tx(tx: &rusqlite::Transaction<'_>, collection: &str) -> Result<()> {
+    validate_collection_name(collection)?;
+    tx.execute_batch(&format!(
+        "CREATE TABLE IF NOT EXISTS {} (
+            key TEXT PRIMARY KEY,
+            data TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        )",
+        quote_identifier(collection),
+    ))?;
+    Ok(())
+}
+
+fn collection_exists_conn(conn: &Connection, collection: &str) -> Result<bool> {
+    validate_collection_name(collection)?;
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1
+            FROM sqlite_master
+            WHERE type = 'table' AND name = ?
+        )",
+        [collection],
+        |r| r.get(0),
+    )?;
+    Ok(exists != 0)
+}
+
 fn attach_namespace_object_tx(
     tx: &rusqlite::Transaction<'_>,
     namespace: &str,
@@ -1589,6 +2047,19 @@ fn validate_key(value: &str, kind: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_collection_name(collection: &str) -> Result<()> {
+    validate_key(collection, "collection")?;
+    if collection.starts_with("sqlite_")
+        || collection.starts_with("cas_")
+        || collection.starts_with("__")
+    {
+        return Err(StoreError::InvalidKey(format!(
+            "collection uses reserved prefix: {collection}"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_content_id(content_id: &str) -> Result<()> {
     let (algo, digest) = content_id
         .split_once(':')
@@ -1620,6 +2091,10 @@ fn base16_encode(bytes: &[u8]) -> String {
         let _ = write!(&mut out, "{b:02x}");
     }
     out
+}
+
+fn quote_identifier(ident: &str) -> String {
+    format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
 #[cfg(test)]
@@ -1725,5 +2200,77 @@ mod tests {
         assert_eq!(got, b"syncme");
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn document_api_roundtrip_works() {
+        let store = Store::memory().expect("store");
+        store
+            .put_value(
+                "users",
+                "alice",
+                &serde_json::json!({"name": "Alice", "age": 30}),
+            )
+            .expect("put");
+
+        let exists = store.exists("users", "alice").expect("exists");
+        assert!(exists);
+        assert_eq!(store.count("users").expect("count"), 1);
+        assert_eq!(
+            store.list("users").expect("list"),
+            vec!["alice".to_string()]
+        );
+        assert_eq!(
+            store.collections().expect("collections"),
+            vec!["users".to_string()]
+        );
+
+        let user = store
+            .get_value("users", "alice")
+            .expect("get")
+            .expect("user");
+        assert_eq!(user["name"], serde_json::Value::from("Alice"));
+
+        let all = store.all_values("users").expect("all");
+        assert_eq!(all.len(), 1);
+        assert!(store.delete("users", "alice").expect("delete"));
+        assert!(!store.exists("users", "alice").expect("exists after delete"));
+    }
+
+    #[test]
+    fn object_api_uses_aliases_and_metadata() {
+        let store = Store::memory().expect("store");
+        let object = store
+            .put_object("assets", "logo.svg", b"<svg/>", Some("image/svg+xml"), None)
+            .expect("put object");
+        assert_eq!(object.namespace, "assets");
+        assert_eq!(object.key, "logo.svg");
+
+        let read = store
+            .get_object("assets", "logo.svg")
+            .expect("read")
+            .expect("exists");
+        assert_eq!(read, b"<svg/>");
+
+        let head = store
+            .head_object("assets", "logo.svg")
+            .expect("head")
+            .expect("exists");
+        assert_eq!(head.mime_type.as_deref(), Some("image/svg+xml"));
+
+        let listed = store
+            .list_objects(Some("assets"), Some("logo"))
+            .expect("list objects");
+        assert_eq!(listed.len(), 1);
+        assert!(store.delete_object("assets", "logo.svg").expect("delete"));
+    }
+
+    #[test]
+    fn info_uses_persisted_meta_values() {
+        let store = Store::memory().expect("store");
+        let info = store.info().expect("info");
+        assert_eq!(info.instance_id, store.instance_id());
+        assert_eq!(info.schema_version, 4);
+        assert!(!info.initialized_at.is_empty());
     }
 }

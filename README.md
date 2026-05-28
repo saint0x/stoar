@@ -1,20 +1,25 @@
 # stoar
 
-SQLite-backed content-addressable storage with aliasing, namespace policy, and an optional CLI/HTTP server.
+`stoar` is an embedded SQLite-backed data engine that combines:
 
-`stoar` is a small Rust crate that stores immutable payloads by content hash and layers mutable references and tenancy controls on top. It can be embedded as a library or built with the `cli` feature to get a standalone `stoar` binary.
+- relational SQL in the same `.db` file
+- schemaless JSON document collections
+- a deduplicated object store built on content-addressable storage
 
-## What It Does
+It ships as a Rust library and an optional CLI/server binary.
 
-- Stores immutable objects by `sha256:<digest>`
-- Deduplicates identical content automatically
-- Stores small payloads inline in SQLite and large payloads in chunk rows
-- Exposes mutable aliases: `namespace + alias -> content_id`
-- Tracks refcounts and pin state for retention / garbage collection
-- Supports namespace policies: bearer token, read-only mode, object quota, byte quota
-- Verifies stored content against its digest
-- Exports/imports full CAS state for replication or migration
-- Can run as an HTTP service with admin and namespace-scoped auth
+## Product Model
+
+`stoar` has three layers that share one SQLite file:
+
+1. Documents
+   User collections are JSON tables with `key`, `data`, `created_at`, and `updated_at`.
+2. Objects
+   High-level objects live behind `namespace + key` aliases and point to immutable CAS content.
+3. SQL
+   You can create and query arbitrary relational tables directly through SQLite.
+
+The low-level CAS layer adds deduplication, range reads, verification, pinning, refcounts, snapshotting, and sync export/import.
 
 ## Install
 
@@ -25,196 +30,153 @@ SQLite-backed content-addressable storage with aliasing, namespace policy, and a
 stoar = { path = "/path/to/stoar" }
 ```
 
-### CLI / Server Binary
+### CLI
 
 ```bash
 cargo build --release --features cli
 cp target/release/stoar /usr/local/bin/stoar
 ```
 
-## Library API
+## Rust API
 
-### Open a Store
+### Documents
 
 ```rust
-use stoar::Store;
+use stoar::{json, Store};
 
-let store = Store::open("stoar.db")?;
+let store = Store::open("app.db")?;
+
+store.put_value("users", "alice", &json!({
+    "name": "Alice",
+    "role": "admin"
+}))?;
+
+let user: Option<serde_json::Value> = store.get_value("users", "alice")?;
+let exists = store.exists("users", "alice")?;
+let keys = store.list("users")?;
+let rows = store.all_values("users")?;
+let count = store.count("users")?;
 ```
 
-### Put and Get Content
+### Objects
 
 ```rust
-let content_id = store.put_content(b"hello world", Some("text/plain"))?;
-
-let data = store.get_content(&content_id)?.expect("content exists");
-assert_eq!(data, b"hello world");
-```
-
-### Stream from a File
-
-```rust
-let content_id = store.put_content_file("./logo.png", Some("image/png"))?;
-```
-
-### Read Metadata
-
-```rust
-let meta = store.head_content(&content_id)?.expect("metadata exists");
-println!("{}", meta.size_bytes);
-println!("{}", meta.storage_kind);
-```
-
-### Aliases
-
-```rust
-let record = store.set_alias("images", "logo", &content_id, None)?;
-
-let resolved = store
-    .resolve_alias("images", "logo")?
-    .expect("alias exists");
-
-assert_eq!(record.content_id, resolved.content_id);
-```
-
-### Namespace Policy
-
-```rust
-store.upsert_namespace(
-    "images",
-    Some("secret-token"),
-    false,
-    Some(10_000),
-    Some(100 * 1024 * 1024),
+let object = store.put_object(
+    "assets",
+    "logo.svg",
+    br#"<svg viewBox="0 0 10 10"></svg>"#,
+    Some("image/svg+xml"),
+    None,
 )?;
 
-store.attach_content_to_namespace("images", &content_id)?;
-assert!(store.namespace_has_content("images", &content_id)?);
+let bytes = store.get_object("assets", "logo.svg")?;
+let head = store.head_object("assets", "logo.svg")?;
+let all_objects = store.list_objects(Some("assets"), Some("logo"))?;
+let deleted = store.delete_object("assets", "logo.svg")?;
 ```
 
-### Retention and GC
+### SQL
 
 ```rust
-store.inc_ref(&content_id)?;
-store.pin(&content_id)?;
-
-let dry_run = store.gc_run(true)?;
-println!("candidates: {}", dry_run.candidates);
-```
-
-### Verification
-
-```rust
-let result = store.verify_content(&content_id)?;
-assert!(result.ok);
-```
-
-### Snapshot and Sync
-
-```rust
-store.snapshot_create("backup.db")?;
-store.sync_export("replica-sync.json")?;
-store.sync_import("replica-sync.json")?;
-```
-
-### Raw SQL
-
-```rust
-let rows = store.query_sql(
-    "SELECT namespace, alias, content_id FROM cas_aliases WHERE namespace = ?",
-    &[&"images"],
+store.execute_sql(
+    "CREATE TABLE IF NOT EXISTS invoices (id TEXT PRIMARY KEY, total_cents INTEGER NOT NULL)",
+    &[],
 )?;
+
+store.execute_sql(
+    "INSERT INTO invoices (id, total_cents) VALUES (?, ?)",
+    &[&"inv_1", &2500_i64],
+)?;
+
+let rows = store.query_sql("SELECT id, total_cents FROM invoices ORDER BY id", &[])?;
+```
+
+### Typed JSON Queries
+
+```rust
+#[derive(serde::Deserialize)]
+struct Product {
+    name: String,
+    price: f64,
+}
+
+let expensive: Vec<Product> = store.query(
+    "SELECT data FROM products WHERE json_extract(data, '$.price') > ?",
+    &[&100.0],
+)?;
+```
+
+### CAS / Replication / Maintenance
+
+```rust
+let cid = store.put_content(b"hello", Some("text/plain"))?;
+let verify = store.verify_content(&cid)?;
+let report = store.gc_run(true)?;
+store.snapshot_create("snapshot.db")?;
+store.sync_export("sync.json")?;
 ```
 
 ## CLI
 
-The binary is feature-gated behind `--features cli`.
-
-### CAS
+### Documents
 
 ```bash
-stoar --db stoar.db cas put ./logo.png --mime image/png
-stoar --db stoar.db cas get sha256:... -o ./logo.png
-stoar --db stoar.db cas head sha256:...
+stoar --db app.db info
+stoar --db app.db collections
+stoar --db app.db doc put users alice '{"name":"Alice","role":"admin"}'
+stoar --db app.db doc get users alice
+stoar --db app.db doc list users
+stoar --db app.db doc all users
+stoar --db app.db doc count users
+stoar --db app.db doc exists users alice
+stoar --db app.db doc delete users alice
 ```
 
-### Aliases
+### Objects
 
 ```bash
-stoar --db stoar.db alias set images logo sha256:...
-stoar --db stoar.db alias get images logo
-stoar --db stoar.db alias delete images logo
+stoar --db app.db object put assets logo.svg ./logo.svg --mime image/svg+xml
+stoar --db app.db object get assets logo.svg -o ./logo.out.svg
+stoar --db app.db object head assets logo.svg
+stoar --db app.db object list --namespace assets --prefix logo
+stoar --db app.db object delete assets logo.svg
 ```
 
-### Refs, Pinning, GC, Verify
+### SQL and CAS
 
 ```bash
-stoar --db stoar.db ref inc sha256:...
-stoar --db stoar.db ref pin sha256:...
-stoar --db stoar.db gc run --dry-run
-stoar --db stoar.db verify sha256:...
-stoar --db stoar.db verify --all
+stoar --db app.db sql "SELECT name FROM sqlite_master WHERE type = 'table'"
+stoar --db app.db cas put ./movie.mp4 --mime video/mp4
+stoar --db app.db verify --all
+stoar --db app.db gc run --dry-run
+stoar --db app.db snapshot create ./snapshot.db
+stoar --db app.db sync export ./sync.json
 ```
 
-### Namespace Management
+### Embedded HTTP Server
 
 ```bash
-stoar --db stoar.db namespace set images --token secret --max-objects 1000 --max-bytes 104857600
-stoar --db stoar.db namespace get images
-stoar --db stoar.db namespace list
+stoar --db app.db serve --listen 127.0.0.1:7777 --token secret
 ```
 
-### SQL / Snapshot / Sync
+Admin routes include:
 
-```bash
-stoar --db stoar.db sql "SELECT * FROM cas_aliases" --mode json
-stoar --db stoar.db snapshot create ./snapshot.db
-stoar --db stoar.db sync export ./sync.json
-stoar --db stoar.db sync import ./sync.json
-```
+- `GET /healthz`
+- `GET /docs`
+- `GET /docs/:collection`
+- `GET|POST|DELETE /docs/:collection/:key`
+- `GET /objects`
+- `GET|POST|DELETE /objects/:namespace/*key`
+- `GET /objects/:namespace/*key/head`
+- `POST /sql`
+- `POST /gc`
+- `POST /verify`
 
-## HTTP Server
+Low-level CAS and namespace-scoped routes remain available for advanced use.
 
-Build with `--features cli` and run:
+## Schema
 
-```bash
-stoar --db stoar.db serve --listen 127.0.0.1:7777 --token admin-token
-```
-
-HTTP surface:
-
-- Admin routes:
-  - `POST /cas`
-  - `GET /cas/:content_id`
-  - `GET /cas/:content_id/head`
-  - `POST|GET|DELETE /alias/:namespace/:alias`
-  - `POST /ref/:action/:content_id`
-  - `POST /gc`
-  - `POST /verify`
-  - `POST /sql`
-  - `GET /admin/namespaces`
-  - `POST /admin/namespace/:namespace`
-- Namespace-scoped routes:
-  - `POST /ns/:namespace/cas`
-  - `GET /ns/:namespace/cas/:content_id`
-  - `GET /ns/:namespace/cas/:content_id/head`
-  - `POST|GET /ns/:namespace/alias/:alias`
-  - `POST /ns/:namespace/ref/:action/:content_id`
-  - `POST /ns/:namespace/verify`
-- Utility:
-  - `GET /healthz`
-  - `GET /readyz`
-  - `GET /metrics`
-
-Auth model:
-
-- Admin routes require `Authorization: Bearer <admin-token>`
-- Namespace routes accept either the admin token or that namespace's configured token
-- Namespace write operations are blocked when the namespace is read-only
-
-## Storage Model
-
-The schema is initialized eagerly on `open()` / `memory()` and currently includes:
+Internal tables:
 
 - `__meta`
 - `cas_objects`
@@ -226,37 +188,23 @@ The schema is initialized eagerly on `open()` / `memory()` and currently include
 - `cas_gc_log`
 - `cas_sql_audit`
 
-Storage strategy:
+User document collections are regular SQLite tables created on first write.
 
-- Payloads up to 1 MiB are stored inline in `cas_objects.inline_blob`
-- Larger payloads are split into 1 MiB chunks in `cas_object_chunks`
-- `content_id` is canonical and content-addressed
-- Alias rows provide mutable names without changing immutable content rows
+## Operational Notes
 
-SQLite connection settings:
+- SQLite is bundled through `rusqlite` for portability.
+- Connections are pooled with `r2d2`.
+- Every acquired connection is configured with WAL, `synchronous=NORMAL`, cache sizing, and foreign keys.
+- Store identity is persisted in `__meta` and exposed via `store.info()`.
+- Object deletion removes aliases; unreferenced content is reclaimed by `gc run`.
 
-- WAL journal mode
-- `synchronous = NORMAL`
-- foreign keys enabled
-- pooled connections via `r2d2_sqlite`
-
-## Build
-
-```bash
-cargo build --release
-cargo build --release --features cli
-```
-
-## Test
+## Development
 
 ```bash
 cargo test
+cargo check --features cli
+cargo check --examples
+cargo check --manifest-path server/Cargo.toml
 ```
 
-The current repository test suite is small and focused on core CAS behavior:
-
-- deduplication
-- alias refcount updates
-- verification and range reads
-- garbage collection
-- sync export/import roundtrip
+For deterministic scenario testing, use Fozzy from the repo root after validating the scenarios in `tests/`.
